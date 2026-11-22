@@ -1,0 +1,10 @@
+# Linux/CUDA only. Keep torch/triton aligned with vLLM's binary wheels.
+torch==2.6.0
+triton==3.2.0
+vllm==0.8.5.post1
+transformers==4.51.3
+datasets==3.6.0
+tensorboard==2.19.0
+python-dotenv==1.1.0
+numpy==1.26.4
+# flash-attn==2.7.4.post1 is installed separately after torch, without build isolation.

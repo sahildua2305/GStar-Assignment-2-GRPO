@@ -14,24 +14,28 @@
 # 8. `masked_mean_drgrpo`: To compute the mean of masked tensor, used in DR-GRPO
 # ==============================================================================
 
+from __future__ import annotations
+
+import argparse
+import json
 import os
 import datetime
 import random
-from typing import Callable, Dict, List, Tuple, Any
+from collections import Counter
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Dict, List, Tuple, Any
 import logging
 import warnings
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
-from vllm import LLM, SamplingParams
-from vllm.model_executor import set_random_seed as vllm_set_random_seed
 from unittest.mock import patch
-from datasets import load_dataset
-from torch.utils.tensorboard import SummaryWriter
 import re
-from dotenv import load_dotenv
-load_dotenv()
+
+if TYPE_CHECKING:
+    from transformers import AutoTokenizer, PreTrainedModel
+    from vllm import LLM, SamplingParams
+    from torch.utils.tensorboard import SummaryWriter
 
 logging.getLogger("vllm.engine.scheduler").setLevel(logging.ERROR)
 os.environ["VLLM_USE_V1"] = "0"
@@ -53,8 +57,11 @@ For example, numbers = [1, 2, 3, 4] and target = 5, the answer is <answer>(1 + 2
 
 
 # vLLM utilities
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85) -> LLM:
-    vllm_set_random_seed(seed)
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85,
+              max_model_len: int = 2048, max_num_seqs: int = 128,
+              enforce_eager: bool = False) -> LLM:
+    from vllm import LLM
+
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
     profiling_patch = patch(
         "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
@@ -66,7 +73,12 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
             dtype=torch.bfloat16,
             enable_prefix_caching=True,
             gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=2048
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+            device=device,
+            seed=seed,
+            enforce_eager=enforce_eager,
+            distributed_executor_backend="uni",
         )
 
 
@@ -74,9 +86,13 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM) -> None:
     state_dict = policy.state_dict()
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
+    # Cached KV states belong to the previous weights.
+    llm.reset_prefix_cache()
 
 
 def init_sampling_params(temperature: float, min_tokens: int, max_tokens: int) -> SamplingParams:
+    from vllm import SamplingParams
+
     sp = SamplingParams(
         temperature=temperature,
         top_p=1.0,
@@ -135,7 +151,9 @@ def _extract_answer(solution_str: str) -> str | None:
         The stripped string content of the last answer tag, or None if no tag is found.
     """
     ### YOUR CODE HERE ###
-    pass
+    for match in re.finditer(r"<answer>(.*?)</answer>", solution_str, re.DOTALL):
+        last_answer = match.group(1).strip()
+    return last_answer if 'last_answer' in locals() else None
     ### END YOUR CODE ###
 
 
@@ -155,7 +173,8 @@ def _validate_numbers(equation_str: str, available_numbers: List[int]) -> bool:
         True if the equation uses the correct numbers, False otherwise.
     """
     ### YOUR CODE HERE ###
-    pass
+    all_nums_in_equation = re.findall(r"\d+", equation_str)
+    return Counter(map(int, all_nums_in_equation)) == Counter(available_numbers)
     ### END YOUR CODE ###
 
 
@@ -168,7 +187,14 @@ def _evaluate_equation(equation_str: str) -> float | None:
         The result of the equation as a float, or None if it's invalid or unsafe.
     """
     ### YOUR CODE HERE ###
-    pass
+    try:
+        # Only allow digits, operators, and parentheses
+        if not re.fullmatch(r"[0-9+\-*/(). ]+", equation_str):
+            return None
+        result = eval(equation_str)
+        return float(result)
+    except:
+        return None
     ### END YOUR CODE ###
 
 # ==============================================================================
@@ -189,7 +215,15 @@ def reward_fn(generated_text: str, ground_truth: Dict) -> float:
         A float value representing the reward, such as 1.0, 0.1, or 0.0
     """
     ### YOUR CODE HERE ###
-    pass
+    answer = _extract_answer(generated_text)
+    if answer is None:
+        return 0.0
+    if not _validate_numbers(answer, ground_truth["numbers"]):
+        return 0.1
+    result = _evaluate_equation(answer)
+    if result is None or result != ground_truth["target"]:
+        return 0.1
+    return 1.0
     ### END YOUR CODE ###
 
 
@@ -201,7 +235,7 @@ def evaluate_model(llm: LLM, sampling_params: SamplingParams, eval_prompts: List
         reward_value = reward_fn(response_text, gt)
         equation = _extract_answer(response_text)
         result = _evaluate_equation(equation) if equation is not None else None
-        output_tokens = len(llm.llm_engine.tokenizer.encode(response_text))
+        output_tokens = len(rollout.outputs[0].token_ids)
         output_token_lengths.append(output_tokens)
         examples.append({
             "prompt": rollout.prompt, "response": response_text, "answer": gt, "equation": equation,
@@ -236,6 +270,8 @@ def _format_eval_example(example: Dict[str, Any]) -> str:
 
 
 def log_train(rollout_batch_loss: float, grad_norm: float, reward_metadata: Dict[str, Any], avg_output_tokens: float, writer: SummaryWriter | None, step: int) -> None:
+    if writer is None:
+        return
     writer.add_scalar("train/loss", float(rollout_batch_loss), global_step=step)
     writer.add_scalar("train/grad_norm", float(grad_norm), global_step=step)
     writer.add_scalar("train/reward_mean", float(reward_metadata["mean"]), global_step=step)
@@ -318,9 +354,30 @@ def compute_group_normalized_advantages(
     # 7. Create a `metadata` dictionary with overall statistics of the raw rewards.
     advantages, raw_rewards, metadata = None, None, {}
     ### YOUR CODE HERE ###
-    pass
+    rewards = []
+    for resp, ground_truth in zip(rollout_responses, repeated_ground_truths):
+        rewards.append(reward_fn(resp, ground_truth))
+
+    raw_rewards = torch.tensor(rewards, dtype=torch.float32)
+    raw_rewards = raw_rewards.view(-1, group_size)
+
+    group_means = raw_rewards.mean(dim=1, keepdim=True)
+    advantages = raw_rewards - group_means
+
+    if normalize_by_std:
+        group_stds = raw_rewards.std(dim=1, keepdim=True) + advantage_eps
+        advantages = advantages / group_stds
+
+    advantages = advantages.flatten()
+
+    metadata = {
+        "mean": raw_rewards.mean().item(),
+        "std": raw_rewards.std().item(),
+        "max": raw_rewards.max().item(),
+        "min": raw_rewards.min().item()
+    }
     ### END YOUR CODE ###
-    return advantages, raw_rewards, metadata
+    return advantages, raw_rewards.flatten(), metadata
 
 
 # ==============================================================================
@@ -349,9 +406,14 @@ def compute_loss(
     """
     loss = 0.0
     ### YOUR CODE HERE ###
-    pass
+    if advantages.ndim == 1:
+        advantages = advantages.unsqueeze(-1)
+    pi_ratio = torch.exp(policy_log_probs - old_log_probs)
+    unclipped_term = pi_ratio * advantages
+    clipped_term = torch.clip(pi_ratio, min=1-clip_range, max=1+clip_range) * advantages
+    loss = -torch.minimum(unclipped_term, clipped_term)
     ### END YOUR CODE ###
-    return loss
+    return loss, {}
 
 
 def masked_mean(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -359,7 +421,10 @@ def masked_mean(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     Compute the mean of tensor values where mask=True for each row, then average across the batch.
     """
     ### YOUR CODE HERE ###
-    pass
+    masked_tensor = torch.where(mask, tensor, 0.0)
+    num_valid_pos = mask.sum(dim=1).clamp(min=1)
+    row_means =  masked_tensor.sum(dim=1) / num_valid_pos
+    return row_means.mean()
     ### END YOUR CODE ###
 
 def masked_mean_drgrpo(tensor: torch.Tensor, mask: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -368,7 +433,9 @@ def masked_mean_drgrpo(tensor: torch.Tensor, mask: torch.Tensor, num_tokens: int
     This is used for the DR-GRPO loss
     """
     ### YOUR CODE HERE ###
-    pass
+    masked_tensor = torch.where(mask, tensor, 0.0)
+    row_means = masked_tensor.sum(dim=1) / max(num_tokens, 1)
+    return row_means.mean()
     ### END YOUR CODE ###
 
 def get_response_log_probs(model: PreTrainedModel, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -392,7 +459,7 @@ def rollout_with_vllm(policy: PreTrainedModel, llm: LLM, sampling_params: Sampli
         for r in rollout.outputs:
             rollout_input_text.append(rollout.prompt)
             rollout_response_text.append(r.text)
-            rollout_output_tokens.append(len(llm.llm_engine.tokenizer.encode(r.text)))
+            rollout_output_tokens.append(len(r.token_ids))
     return rollout_input_text, rollout_response_text, rollout_output_tokens
 
 
@@ -427,17 +494,32 @@ def train(
     group_size: int, gradient_accumulation_steps: int, clip_range: float, use_std_normalization: bool,
     advantage_eps: float, device: str, eval_every: int = 5, writer: SummaryWriter = None, seed: int,
     loss_type: str = "grpo", max_completion_length: int = 256,
+    output_dir: str | None = None,
 ) -> None:
     n_prompts_per_rollout_batch = rollout_batch_size // group_size
     micro_train_batch_size = rollout_batch_size // gradient_accumulation_steps
     random.seed(seed)
     train_step = 0
 
-    metrics = evaluate_model(llm, sampling_params, eval_prompts, eval_answers)
-    if writer:
-        for k in ["accuracy", "mean_reward", "std_reward", "avg_output_tokens", "count_correct", "count_partial", "count_failed"]:
-            writer.add_scalar(f"eval/{k}", metrics[k], global_step=train_step)
-        log_eval(metrics, writer, train_step)
+    def record_eval(step):
+        # Evaluate the policy after the latest optimizer step, including the final step.
+        load_policy_into_vllm_instance(policy, llm)
+        metrics = evaluate_model(llm, sampling_params, eval_prompts, eval_answers)
+        if writer:
+            for k in ["accuracy", "mean_reward", "std_reward", "avg_output_tokens", "count_correct", "count_partial", "count_failed"]:
+                writer.add_scalar(f"eval/{k}", metrics[k], global_step=step)
+            writer.flush()
+        log_eval(metrics, writer, step)
+        if output_dir:
+            path = Path(output_dir)
+            summary = {k: v for k, v in metrics.items() if k != "examples"}
+            with (path / "eval_metrics.jsonl").open("a") as f:
+                f.write(json.dumps({"step": step, **summary}) + "\n")
+            with (path / f"eval_step_{step:04d}.json").open("w") as f:
+                json.dump(metrics, f, indent=2)
+        return metrics
+
+    record_eval(train_step)
 
     for _ in range(n_grpo_steps):
         sampled = random.sample(list(zip(train_prompts, train_answers)), n_prompts_per_rollout_batch)
@@ -462,43 +544,98 @@ def train(
         grad_norm = torch.nn.utils.clip_grad_norm_([p for p in policy.parameters() if p.grad is not None], 1.0)
         optimizer.step()
         scheduler.step()
-        rollout_loss /= (rollout_batch_size / micro_train_batch_size)
         train_step += 1
         print(f"Step {train_step} | Loss: {rollout_loss:.4f} | Grad: {grad_norm:.4f} | "
               f"Reward mean: {reward_meta['mean']:.4f} | Reward std: {reward_meta['std']:.4f}")
         log_train(rollout_loss, grad_norm, reward_meta, avg_output_tokens, writer, train_step)
-        if train_step % eval_every == 0:
-            metrics = evaluate_model(llm, sampling_params, eval_prompts, eval_answers)
-            log_eval(metrics, writer, train_step)
+        if output_dir:
+            with (Path(output_dir) / "train_metrics.jsonl").open("a") as f:
+                f.write(json.dumps({"step": train_step, "loss": rollout_loss,
+                    "grad_norm": float(grad_norm), "reward_mean": reward_meta["mean"],
+                    "reward_std": reward_meta["std"], "avg_output_tokens": avg_output_tokens}) + "\n")
+        if train_step % eval_every == 0 or train_step == n_grpo_steps:
+            record_eval(train_step)
 
 
-def init_policy(model_id: str, device: str) -> Tuple[PreTrainedModel, AutoTokenizer]:
+def init_policy(model_id: str, device: str, gradient_checkpointing: bool = False) -> Tuple[PreTrainedModel, AutoTokenizer]:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     model = AutoModelForCausalLM.from_pretrained(
         model_id, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2", use_cache=False
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
     model.to(device).train()
     return model, tokenizer
 
 
 def main() -> None:
-    # Hyperparameters
-    model_id = "Qwen/Qwen3-1.7B"
-    device = "cuda"
-    seed, gpu_mem_util = 42, 0.4
-    n_grpo_steps, rollout_batch_size, group_size, grad_acc_steps = 80, 128, 8, 32
-    lr, clip_range, adv_eps = 7e-6, 0.2, 1e-6
-    temperature, min_tokens = 1.0, 4
-    eval_every = 10
+    parser = argparse.ArgumentParser(description="Train GRPO or Dr.GRPO on Countdown")
+    parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
+    parser.add_argument("--loss-type", choices=["grpo", "dr_grpo"], default="grpo")
+    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--steps", type=int, default=80)
+    parser.add_argument("--rollout-batch-size", type=int, default=128)
+    parser.add_argument("--group-size", type=int, default=8)
+    parser.add_argument("--grad-acc-steps", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=7e-6)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--eval-every", type=int, default=10)
+    parser.add_argument("--max-train-examples", type=int, default=None)
+    parser.add_argument("--max-eval-examples", type=int, default=None)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.4)
+    parser.add_argument("--max-model-len", type=int, default=2048)
+    parser.add_argument("--max-num-seqs", type=int, default=128)
+    parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--output-dir", default=None)
+    args = parser.parse_args()
+    for name in ["max_tokens", "steps", "rollout_batch_size", "group_size", "grad_acc_steps", "eval_every", "max_model_len", "max_num_seqs"]:
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    for name in ["max_train_examples", "max_eval_examples"]:
+        if getattr(args, name) is not None and getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.group_size < 2:
+        parser.error("--group-size must be at least 2 for group standard deviations")
+    if args.rollout_batch_size % args.group_size or args.rollout_batch_size % args.grad_acc_steps:
+        parser.error("--rollout-batch-size must be divisible by --group-size and --grad-acc-steps")
+    if not 0 < args.gpu_memory_utilization < 1 or args.lr <= 0:
+        parser.error("GPU memory utilization must be in (0, 1), and learning rate must be positive")
+    if args.max_tokens < 4 or args.max_tokens >= args.max_model_len:
+        parser.error("--max-tokens must be at least 4 and leave room for prompts in --max-model-len")
 
-    # CHANGING HYPERPARAMETERS for main assignment
-    loss_type = "grpo" # or "dr_grpo"
-    max_tokens = 256 # or 512, 1024
+    from datasets import load_dataset
+    from dotenv import load_dotenv
+    from torch.utils.tensorboard import SummaryWriter
+
+    load_dotenv()
+    model_id = args.model
+    device = "cuda"
+    seed, gpu_mem_util = args.seed, args.gpu_memory_utilization
+    n_grpo_steps, rollout_batch_size = args.steps, args.rollout_batch_size
+    group_size, grad_acc_steps = args.group_size, args.grad_acc_steps
+    lr, clip_range, adv_eps = args.lr, 0.2, 1e-6
+    temperature, min_tokens = 1.0, 4
+    eval_every = args.eval_every
+    loss_type, max_tokens = args.loss_type, args.max_tokens
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    out_dir = Path(args.output_dir or f"output/{loss_type}_l{max_tokens}_{timestamp}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with (out_dir / "config.json").open("w") as f:
+        json.dump(vars(args), f, indent=2)
     
     # Initialization
     use_std_norm = loss_type == "grpo"
-    policy, tokenizer = init_policy(model_id=model_id, device=device)
-    llm = init_vllm(model_id=model_id, device=device, seed=seed, gpu_memory_utilization=gpu_mem_util)
+    policy, tokenizer = init_policy(model_id=model_id, device=device,
+                                    gradient_checkpointing=args.gradient_checkpointing)
+    llm = init_vllm(model_id=model_id, device=device, seed=seed, gpu_memory_utilization=gpu_mem_util,
+                    max_model_len=args.max_model_len, max_num_seqs=args.max_num_seqs,
+                    enforce_eager=args.enforce_eager)
     sampling_params = init_sampling_params(temperature=temperature, min_tokens=min_tokens, max_tokens=max_tokens)
     
     # Dataset
@@ -516,6 +653,12 @@ def main() -> None:
     # Load properly split dataset
     train_data = load_dataset("justinphan3110/Countdown-Tasks-3to4", split="train")
     eval_data = load_dataset("justinphan3110/Countdown-Tasks-3to4", split="test")
+    if args.max_train_examples is not None:
+        train_data = train_data.select(range(min(args.max_train_examples, len(train_data))))
+    if args.max_eval_examples is not None:
+        eval_data = eval_data.select(range(min(args.max_eval_examples, len(eval_data))))
+    if len(train_data) < rollout_batch_size // group_size:
+        raise ValueError("Training subset must contain at least rollout_batch_size // group_size prompts")
     
     train_examples = build_dataset(train_data)
     eval_examples = build_dataset(eval_data)
@@ -525,8 +668,7 @@ def main() -> None:
     scheduler = get_constant_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=0)
     
     # Logging
-    timestamp = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-    log_dir = os.path.join("./output", "tb", f"hw_a2_{loss_type}", str(timestamp))
+    log_dir = str(out_dir / "tb")
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
     
@@ -540,15 +682,14 @@ def main() -> None:
         gradient_accumulation_steps=grad_acc_steps, clip_range=clip_range,
         use_std_normalization=use_std_norm, advantage_eps=adv_eps, device=device,
         eval_every=eval_every, writer=writer, seed=seed, loss_type=loss_type,
-        max_completion_length=max_tokens
+        max_completion_length=max_tokens, output_dir=str(out_dir)
     )
     
     # Save model
-    out_dir = os.path.join("./output", f"hw_a2_solution_{timestamp}")
-    os.makedirs(out_dir, exist_ok=True)
-    policy.save_pretrained(out_dir)
-    tokenizer.save_pretrained(out_dir)
-    print(f"Saved model and tokenizer to {out_dir}")
+    checkpoint_dir = out_dir / "checkpoint"
+    policy.save_pretrained(checkpoint_dir)
+    tokenizer.save_pretrained(checkpoint_dir)
+    print(f"Saved model and tokenizer to {checkpoint_dir}")
     writer.close()
 
 if __name__ == "__main__":

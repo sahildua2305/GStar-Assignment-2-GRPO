@@ -3,3 +3,7 @@ venv/
 base.py
 base_long.py
 .DS_Store
+__pycache__/
+output/
+.env
+eval_results/
