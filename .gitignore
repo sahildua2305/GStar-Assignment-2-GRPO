@@ -1,5 +1,6 @@
 venv/
 .venv/
+.venv-plots/
 base.py
 base_long.py
 .DS_Store
